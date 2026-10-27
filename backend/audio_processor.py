@@ -31,10 +31,8 @@ class AudioProcessor:
         
         # Internal state for smooth streaming
         self._prev_rms: float = 0.05
-        self._noise_profile: Optional[np.ndarray] = None
-        self._noise_frames_collected: int = 0
-        self._noise_frames_needed: int = 10
-        self._noise_buffer: list = []
+        self._noise_floor: Optional[np.ndarray] = None
+        self._smooth_spectral_gain: Optional[np.ndarray] = None
         
         # Gate envelope follower
         self._gate_gain: float = 0.0
@@ -58,11 +56,11 @@ class AudioProcessor:
         self.is_gate_open: bool = False
 
     def _setup_filters(self):
-        """Pre-compute biquad filter coefficients for traffic cut and articulation."""
+        """Pre-compute biquad filter coefficients for traffic/fan cut and articulation."""
         nyquist = self.sample_rate / 2.0
         
-        # 1. 4th-order Butterworth High-Pass at 135 Hz (Vehicle rumble / traffic / desk thumps cut)
-        b_hp, a_hp = signal.butter(4, 135.0 / nyquist, btype='highpass')
+        # 1. 4th-order Butterworth High-Pass at 150 Hz (Fan motor hum, vehicle rumble, desk thumps cut)
+        b_hp, a_hp = signal.butter(4, 150.0 / nyquist, btype='highpass')
         self._traffic_hp_filter = (b_hp, a_hp)
         self._traffic_hp_state = signal.lfilter_zi(b_hp, a_hp)
         
@@ -137,28 +135,76 @@ class AudioProcessor:
             self.start_output_stream(new_settings.output_device_index)
 
     def _apply_traffic_and_rumble_cut(self, chunk: np.ndarray) -> np.ndarray:
-        """Strips vehicle exhaust, tire rumble, subways, and fan low-frequencies (<135Hz)."""
+        """Strips fan motor drone, road vibration, subways, and low-frequency rumbling (<150Hz)."""
         if not self.settings.traffic_cut_enabled:
             return chunk
         b_hp, a_hp = self._traffic_hp_filter
         filtered, self._traffic_hp_state = signal.lfilter(b_hp, a_hp, chunk, zi=self._traffic_hp_state)
         return filtered.astype(np.float32)
 
+    def _denoise_chunk(self, chunk: np.ndarray) -> np.ndarray:
+        """
+        Continuous Minimum-Statistics Spectral Subtractor:
+        Dynamically models and suppresses stationary fan noise, AC hum, and laptop cooler hiss
+        without distorting the primary voice.
+        """
+        if not self.settings.denoise_enabled or self.settings.denoise_strength <= 0.01:
+            return chunk
+            
+        strength = float(self.settings.denoise_strength)
+        
+        # Real FFT of chunk
+        spectrum = np.fft.rfft(chunk)
+        magnitude = np.abs(spectrum)
+        phase = np.angle(spectrum)
+        
+        # Initialize or recursively track background noise floor
+        if self._noise_floor is None or len(self._noise_floor) != len(magnitude):
+            self._noise_floor = magnitude.copy()
+            self._smooth_spectral_gain = np.ones_like(magnitude)
+        else:
+            # Asymmetric leaky integrator:
+            # - Rapidly tracks down to lower energy during pauses/unvoiced moments (factor 0.20)
+            # - Very slowly creeps up during speech (factor 0.002) so speech peaks don't raise noise floor
+            is_lower = magnitude < self._noise_floor
+            self._noise_floor[is_lower] = 0.80 * self._noise_floor[is_lower] + 0.20 * magnitude[is_lower]
+            self._noise_floor[~is_lower] = 0.998 * self._noise_floor[~is_lower] + 0.002 * magnitude[~is_lower]
+
+        # Calculate localized SNR per bin
+        snr = magnitude / (self._noise_floor + 1e-7)
+        
+        # Over-subtraction factor scales with user strength slider (1.5 to 3.8x)
+        alpha = 1.5 + (strength * 2.3)
+        # Spectral floor (down to -36 dB) prevents musical artifacting while removing all whoosh
+        beta = max(0.015, 0.08 * (1.0 - strength))
+        
+        # Gain computation
+        raw_gain = np.clip(1.0 - (alpha / (snr + 1e-6)), beta, 1.0)
+        
+        # Smooth gain across frames to eliminate fluttering
+        if self._smooth_spectral_gain is None:
+            self._smooth_spectral_gain = raw_gain
+        else:
+            self._smooth_spectral_gain = 0.55 * self._smooth_spectral_gain + 0.45 * raw_gain
+            
+        clean_mag = magnitude * self._smooth_spectral_gain
+        clean_fft = clean_mag * np.exp(1j * phase)
+        cleaned = np.fft.irfft(clean_fft, n=len(chunk))
+        return cleaned.astype(np.float32)
+
     def _apply_proximity_voice_gate(self, chunk: np.ndarray, current_db: float) -> Tuple[np.ndarray, bool]:
         """
         Close-Proximity Voice Expander / Gate:
-        Suppresses distant chatter and vehicle sounds that are below the close-mic threshold.
+        Suppresses distant chatter, fan residual, and room noise below threshold.
         """
         if not self.settings.gate_enabled:
             return chunk, True
 
-        thresh_db = self.settings.gate_threshold_db
-        # Is input loud enough to be the primary user speaking near the mic?
+        thresh_db = float(self.settings.gate_threshold_db)
         is_above_thresh = current_db > thresh_db
 
-        # Envelope follower with fast attack (5ms) and smooth hold/release (150ms)
         chunk_frames = len(chunk)
-        hold_frames = int(0.18 * (self.sample_rate / chunk_frames))  # ~180ms hold
+        hold_frames = int(0.14 * (self.sample_rate / chunk_frames))  # ~140ms hold
         
         if is_above_thresh:
             target_gain = 1.0
@@ -168,51 +214,15 @@ class AudioProcessor:
                 self._gate_hold_counter -= 1
                 target_gain = 1.0
             else:
-                target_gain = 0.0  # Completely mute background sounds when not speaking
+                target_gain = 0.0  # Completely mute residual noise when not speaking
 
-        # Fast attack (5ms), snappy release (~100ms)
-        rate = 0.7 if target_gain > self._gate_gain else 0.4
+        # Fast attack (4ms), smooth release
+        rate = 0.85 if target_gain > self._gate_gain else 0.35
         self._gate_gain = (1.0 - rate) * self._gate_gain + rate * target_gain
-        self.is_gate_open = bool(self._gate_gain > 0.1)
+        self.is_gate_open = bool(self._gate_gain > 0.05)
 
         gated = chunk * self._gate_gain
         return gated.astype(np.float32), self.is_gate_open
-
-    def _denoise_chunk(self, chunk: np.ndarray) -> np.ndarray:
-        """Adaptive multi-band spectral subtraction & background suppression."""
-        if not self.settings.denoise_enabled or self.settings.denoise_strength <= 0.01:
-            return chunk
-            
-        strength = self.settings.denoise_strength
-        rms = np.sqrt(np.mean(chunk ** 2) + 1e-9)
-        
-        # When quiet (below gate), continuously refine stationary noise spectrum
-        if rms < 0.015 and self._noise_frames_collected < self._noise_frames_needed:
-            self._noise_buffer.append(chunk)
-            self._noise_frames_collected += 1
-            if self._noise_frames_collected == self._noise_frames_needed:
-                combined = np.concatenate(self._noise_buffer)
-                self._noise_profile = np.abs(np.fft.rfft(combined[:self.settings.chunk_size]))
-        
-        # Fast FFT spectral gating with over-subtraction factor
-        spectrum = np.fft.rfft(chunk)
-        magnitude = np.abs(spectrum)
-        phase = np.angle(spectrum)
-        
-        if self._noise_profile is not None and len(self._noise_profile) == len(magnitude):
-            # Aggressive over-subtraction for vehicle noise & diffuse room sound
-            over_sub = 1.0 + (strength * 1.5)
-            noise_est = self._noise_profile * strength * over_sub
-            # Spectral floor (prevents robotic musical noise)
-            clean_mag = np.maximum(magnitude - noise_est, magnitude * 0.05)
-        else:
-            # Multi-band spectral gating threshold
-            gate_thresh = 0.018 * strength
-            clean_mag = np.where(magnitude < gate_thresh, magnitude * 0.1, magnitude)
-            
-        clean_fft = clean_mag * np.exp(1j * phase)
-        cleaned = np.fft.irfft(clean_fft, n=len(chunk))
-        return cleaned.astype(np.float32)
 
     def _apply_articulation_boost(self, chunk: np.ndarray) -> np.ndarray:
         """Boosts vocal clarity formants (2.8 kHz) for consonant intelligibility."""
@@ -276,22 +286,26 @@ class AudioProcessor:
             self.is_speaking = bool(in_rms > 0.015)
             self.is_gate_open = True
         else:
-            # 3. Stage 1: Strip vehicle & traffic rumble (< 135 Hz)
+            # 3. Stage 1: Strip fan motor drone & low-frequency rumble (< 150 Hz)
             de_rumbled = self._apply_traffic_and_rumble_cut(chunk)
 
-            # 4. Stage 2: Close-Proximity Voice Gate (attenuates distant vehicles & outside people)
-            gated, gate_open = self._apply_proximity_voice_gate(de_rumbled, self.input_level_db)
+            # 4. Stage 2: Adaptive Spectral Subtraction (Continuous Fan / Hiss suppression)
+            denoised = self._denoise_chunk(de_rumbled)
 
-            # 5. Stage 3: Multi-band Spectral Noise Reduction
-            denoised = self._denoise_chunk(gated)
+            # Measure clean level for proximity gate decision
+            clean_rms = np.sqrt(np.mean(denoised ** 2) + 1e-9)
+            clean_db = float(20.0 * math.log10(max(clean_rms, 1e-4)))
+
+            # 5. Stage 3: Close-Proximity Voice Gate (Mutes silence and residual background below threshold)
+            gated, gate_open = self._apply_proximity_voice_gate(denoised, clean_db)
             
             # 6. Stage 4: Vocal Articulation & Consonant Formant Restoration
-            articulated = self._apply_articulation_boost(denoised)
+            articulated = self._apply_articulation_boost(gated)
             
             # 7. Stage 5: Gated AGC & Normalization
             out_chunk = self._apply_agc_and_gain(articulated, gate_open)
 
-            self.is_speaking = bool(gate_open and in_rms > 0.015)
+            self.is_speaking = bool(gate_open and clean_rms > 0.012)
 
         # Output telemetry
         out_rms = np.sqrt(np.mean(out_chunk ** 2) + 1e-9)

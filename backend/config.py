@@ -14,12 +14,12 @@ class PipelineSettings(BaseModel):
     # Audio processing toggles & parameters
     bypass: bool = False
     denoise_enabled: bool = True
-    denoise_strength: float = 0.85  # 0.0 to 1.0
+    denoise_strength: float = 0.90  # 0.0 to 1.0 (strong fan / ambient suppression)
     
-    # Noise Gate & Close-Proximity Voice Isolation (Suppresses traffic, other people's voices)
+    # Noise Gate & Close-Proximity Voice Isolation (Suppresses traffic, fan, other voices)
     gate_enabled: bool = True
-    gate_threshold_db: float = -36.0  # -55 dB (sensitive) to -20 dB (strict close-mic only)
-    traffic_cut_enabled: bool = True  # High-pass filter (135 Hz) cuts vehicle engines and road vibration
+    gate_threshold_db: float = -34.0  # -50 dB (sensitive) to -20 dB (strict close-mic only)
+    traffic_cut_enabled: bool = True  # High-pass filter (150 Hz) cuts vehicle engines and fan hum
     suppress_far_voices: bool = True  # Attenuate diffuse background chatter and room reverb
     
     # Gain & dynamics

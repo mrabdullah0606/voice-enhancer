@@ -199,6 +199,14 @@ def process_and_bundle_dataset(target_sr: int = 40000) -> Dict[str, Any]:
                 float_data = signal.resample(float_data, num_samples).astype(np.float32)
                 sr = target_sr
 
+            # Clean stationary fan noise / room hiss before training slicing
+            try:
+                import noisereduce as nr
+                cleaned_data = nr.reduce_noise(y=float_data, sr=sr, stationary=True, prop_decrease=0.88)
+                float_data = cleaned_data.astype(np.float32)
+            except Exception as nr_err:
+                logger.warning(f"noisereduce pass skipped: {nr_err}")
+
             slices = slice_audio(float_data, sr)
             for s in slices:
                 slice_count += 1

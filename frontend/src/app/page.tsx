@@ -87,7 +87,7 @@ export default function VoiceEnhancementDashboard() {
 
   // DSP & AI Enhancement Settings
   const [bypass, setBypass] = useState<boolean>(false);
-  const [denoiseStrength, setDenoiseStrength] = useState<number>(0.85);
+  const [denoiseStrength, setDenoiseStrength] = useState<number>(0.90);
   const [gainDb, setGainDb] = useState<number>(6.0);
   const [agcEnabled, setAgcEnabled] = useState<boolean>(true);
   const [articulationBoost, setArticulationBoost] = useState<boolean>(true);
@@ -330,12 +330,20 @@ export default function VoiceEnhancementDashboard() {
       let stream: MediaStream;
       try {
         stream = await navigator.mediaDevices.getUserMedia({
-          audio: selectedInputDeviceId
-            ? { deviceId: { ideal: selectedInputDeviceId } }
-            : true,
+          audio: {
+            deviceId: selectedInputDeviceId ? { ideal: selectedInputDeviceId } : undefined,
+            echoCancellation: true,
+            noiseSuppression: false, // Handled cleanly by backend DSP
+            autoGainControl: false,  // CRITICAL: Stop Windows/Chromium from ramping up fan noise when user pauses!
+          },
         });
       } catch {
-        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            autoGainControl: false,
+          },
+        });
       }
       mediaStreamRef.current = stream;
 
@@ -513,12 +521,21 @@ export default function VoiceEnhancementDashboard() {
       let stream: MediaStream;
       try {
         stream = await navigator.mediaDevices.getUserMedia({
-          audio: selectedInputDeviceId
-            ? { deviceId: { ideal: selectedInputDeviceId } }
-            : true,
+          audio: {
+            deviceId: selectedInputDeviceId ? { ideal: selectedInputDeviceId } : undefined,
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: false,
+          },
         });
       } catch {
-        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: false,
+          },
+        });
       }
 
       const recorder = new MediaRecorder(stream);
