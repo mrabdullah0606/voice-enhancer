@@ -118,6 +118,7 @@ async def upload_audio_sample(file: UploadFile = File(...)):
         save_path = os.path.join(dataset_prep.DATASET_RAW_DIR, save_name)
         with open(save_path, "wb") as f_out:
             f_out.write(content)
+        dataset_prep.ensure_pcm_wav(save_path)
         stats = dataset_prep.get_dataset_stats()
         return {"success": True, "saved_as": save_name, "stats": stats}
     except Exception as e:
@@ -129,6 +130,33 @@ async def process_dataset_endpoint():
     """Run slicing, peak normalization, and bundle into user_voice_dataset.zip."""
     res = dataset_prep.process_and_bundle_dataset()
     return res
+
+@app.get("/api/dataset/raw_list")
+async def get_raw_dataset_list():
+    """List all raw audio files."""
+    files = [f for f in os.listdir(dataset_prep.DATASET_RAW_DIR) if f.endswith(".wav")]
+    return {"files": sorted(files)}
+
+@app.get("/api/dataset/raw_file/{filename}")
+async def get_raw_audio_file(filename: str):
+    """Serve a raw audio file."""
+    fpath = os.path.join(dataset_prep.DATASET_RAW_DIR, filename)
+    if not os.path.exists(fpath):
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(fpath, media_type="application/octet-stream")
+
+@app.post("/api/dataset/overwrite_sample/{filename}")
+async def overwrite_raw_sample(filename: str, file: UploadFile = File(...)):
+    """Overwrite an existing raw sample with genuine PCM WAV."""
+    try:
+        content = await file.read()
+        fpath = os.path.join(dataset_prep.DATASET_RAW_DIR, filename)
+        with open(fpath, "wb") as f_out:
+            f_out.write(content)
+        return {"success": True, "overwritten": filename}
+    except Exception as e:
+        logger.error(f"Error overwriting sample: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/dataset/download_zip")
 async def download_dataset_zip():

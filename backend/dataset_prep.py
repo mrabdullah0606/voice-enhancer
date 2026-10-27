@@ -14,6 +14,8 @@ import numpy as np
 from scipy.io import wavfile
 from scipy import signal
 from typing import List, Dict, Any, Tuple
+import subprocess
+import shutil
 import logging
 
 logger = logging.getLogger("voice_enhancer.dataset")
@@ -24,6 +26,49 @@ DATASET_ZIP_PATH = os.path.join(os.path.dirname(__file__), "dataset", "user_voic
 
 os.makedirs(DATASET_RAW_DIR, exist_ok=True)
 os.makedirs(DATASET_PROCESSED_DIR, exist_ok=True)
+
+
+def find_ffmpeg() -> str:
+    """Locates ffmpeg binary from local tools, system PATH, or npm modules."""
+    local_tool = os.path.join(os.path.dirname(__file__), "tools", "ffmpeg.exe")
+    if os.path.exists(local_tool):
+        return local_tool
+    sys_ffmpeg = shutil.which("ffmpeg")
+    if sys_ffmpeg:
+        return sys_ffmpeg
+    frontend_ffmpeg = os.path.join(
+        os.path.dirname(os.path.dirname(__file__)),
+        "frontend", "node_modules", "@ffmpeg-installer", "win32-x64", "ffmpeg.exe"
+    )
+    if os.path.exists(frontend_ffmpeg):
+        return frontend_ffmpeg
+    return "ffmpeg"
+
+
+def ensure_pcm_wav(file_path: str, target_sr: int = 40000) -> bool:
+    """If file is WebM or not standard RIFF PCM, transcode in-place using ffmpeg."""
+    try:
+        if not os.path.exists(file_path):
+            return False
+        with open(file_path, "rb") as f:
+            header = f.read(12)
+        if len(header) >= 4 and header[:4] == b"RIFF":
+            return True
+
+        ffmpeg_bin = find_ffmpeg()
+        tmp_out = file_path + ".converted.wav"
+        cmd = [ffmpeg_bin, "-y", "-i", file_path, "-ac", "1", "-ar", str(target_sr), "-c:a", "pcm_s16le", tmp_out]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode == 0 and os.path.exists(tmp_out):
+            os.replace(tmp_out, file_path)
+            logger.info(f"Auto-converted {file_path} to 16-bit PCM WAV")
+            return True
+        else:
+            logger.warning(f"ffmpeg conversion failed for {file_path}: {res.stderr}")
+            return False
+    except Exception as e:
+        logger.error(f"Error ensuring PCM WAV for {file_path}: {e}")
+        return False
 
 
 def normalize_audio(audio: np.ndarray, target_peak_db: float = -1.0) -> np.ndarray:
@@ -82,6 +127,7 @@ def get_dataset_stats() -> Dict[str, Any]:
     raw_files = glob.glob(os.path.join(DATASET_RAW_DIR, "*.wav"))
     total_seconds = 0.0
     for f in raw_files:
+        ensure_pcm_wav(f)
         try:
             sr, data = wavfile.read(f)
             total_seconds += len(data) / float(sr)
@@ -132,6 +178,7 @@ def process_and_bundle_dataset(target_sr: int = 40000) -> Dict[str, Any]:
     total_sec = 0.0
 
     for file_path in raw_files:
+        ensure_pcm_wav(file_path, target_sr=target_sr)
         try:
             sr, data = wavfile.read(file_path)
             # Convert integer formats to float32 [-1.0, 1.0]

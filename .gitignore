@@ -57,5 +57,7 @@ pnpm-debug.log*
 *.swo
 .DS_Store
 Thumbs.db
-ehthumbs.db
+# Windows binaries & tools
+*.exe
+backend/tools/
 [Dd]esktop.ini

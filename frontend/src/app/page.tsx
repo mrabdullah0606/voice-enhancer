@@ -466,6 +466,47 @@ export default function VoiceEnhancementDashboard() {
     return () => cancelAnimationFrame(animId);
   }, [bypass]);
 
+  // Helper to encode AudioBuffer into genuine 16-bit PCM WAV (RIFF/WAVE)
+  const audioBufferToWav = (buffer: AudioBuffer): Blob => {
+    const numChannels = 1;
+    const sampleRate = buffer.sampleRate;
+    const format = 1; // PCM
+    const bitDepth = 16;
+    const channelData = buffer.getChannelData(0);
+    const dataLength = channelData.length * 2;
+    const bufferLength = 44 + dataLength;
+    const arrayBuffer = new ArrayBuffer(bufferLength);
+    const view = new DataView(arrayBuffer);
+
+    const writeString = (offset: number, str: string) => {
+      for (let i = 0; i < str.length; i++) {
+        view.setUint8(offset + i, str.charCodeAt(i));
+      }
+    };
+
+    writeString(0, "RIFF");
+    view.setUint32(4, 36 + dataLength, true);
+    writeString(8, "WAVE");
+    writeString(12, "fmt ");
+    view.setUint32(16, 16, true);
+    view.setUint16(20, format, true);
+    view.setUint16(22, numChannels, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * numChannels * 2, true);
+    view.setUint16(32, numChannels * 2, true);
+    view.setUint16(34, bitDepth, true);
+    writeString(36, "data");
+    view.setUint32(40, dataLength, true);
+
+    let offset = 44;
+    for (let i = 0; i < channelData.length; i++, offset += 2) {
+      const s = Math.max(-1, Math.min(1, channelData[i]));
+      view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    }
+
+    return new Blob([view], { type: "audio/wav" });
+  };
+
   // Dataset prompt recording functions
   const startRecordingPrompt = async () => {
     try {
@@ -489,10 +530,22 @@ export default function VoiceEnhancementDashboard() {
         }
       };
 
-      recorder.onstop = () => {
-        const blob = new Blob(datasetChunksRef.current, { type: "audio/wav" });
-        setPromptBlob(blob);
-        setPromptAudioUrl(URL.createObjectURL(blob));
+      recorder.onstop = async () => {
+        const rawBlob = new Blob(datasetChunksRef.current, {
+          type: recorder.mimeType || "audio/webm",
+        });
+        try {
+          const ab = await rawBlob.arrayBuffer();
+          const decodeCtx = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
+          const decoded = await decodeCtx.decodeAudioData(ab);
+          const wavBlob = audioBufferToWav(decoded);
+          decodeCtx.close();
+          setPromptBlob(wavBlob);
+          setPromptAudioUrl(URL.createObjectURL(wavBlob));
+        } catch {
+          setPromptBlob(rawBlob);
+          setPromptAudioUrl(URL.createObjectURL(rawBlob));
+        }
         stream.getTracks().forEach((t) => t.stop());
       };
 
@@ -545,9 +598,41 @@ export default function VoiceEnhancementDashboard() {
     }
   };
 
+  // Converts any browser WebM raw files to PCM WAV and runs slicing
   const processDataset = async () => {
     setIsProcessingDataset(true);
     try {
+      // 1. Check if raw files need conversion from WebM to PCM WAV
+      const listRes = await fetch("http://127.0.0.1:8000/api/dataset/raw_list");
+      const listData = await listRes.json();
+      const files: string[] = listData.files || [];
+
+      if (files.length > 0) {
+        const decodeCtx = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
+        for (const fname of files) {
+          try {
+            const fRes = await fetch(`http://127.0.0.1:8000/api/dataset/raw_file/${fname}`);
+            const ab = await fRes.arrayBuffer();
+            // Check if it starts with EBML (WebM)
+            const header = new Uint8Array(ab.slice(0, 4));
+            if (header[0] === 0x1a && header[1] === 0x45 && header[2] === 0xdf && header[3] === 0xa3) {
+              const decoded = await decodeCtx.decodeAudioData(ab);
+              const wavBlob = audioBufferToWav(decoded);
+              const formData = new FormData();
+              formData.append("file", wavBlob, fname);
+              await fetch(`http://127.0.0.1:8000/api/dataset/overwrite_sample/${fname}`, {
+                method: "POST",
+                body: formData,
+              });
+            }
+          } catch (e) {
+            console.warn(`Skip conversion for ${fname}:`, e);
+          }
+        }
+        decodeCtx.close();
+      }
+
+      // 2. Trigger slicing, normalization & zip bundling
       const res = await fetch("http://127.0.0.1:8000/api/dataset/process", {
         method: "POST",
       });
@@ -558,7 +643,8 @@ export default function VoiceEnhancementDashboard() {
       } else {
         alert("Dataset processing returned: " + (data.error || "unknown error"));
       }
-    } catch {
+    } catch (err) {
+      console.error("Process dataset error:", err);
       alert("Failed to process dataset.");
     } finally {
       setIsProcessingDataset(false);
