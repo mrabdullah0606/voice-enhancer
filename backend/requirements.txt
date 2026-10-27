@@ -6,3 +6,5 @@ scipy>=1.14.0
 sounddevice>=0.5.0
 pydantic>=2.8.0
 noisereduce>=3.0.0
+python-multipart>=0.0.9
+soundfile>=0.12.0
