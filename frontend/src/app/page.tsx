@@ -626,14 +626,23 @@ export default function VoiceEnhancementDashboard() {
   const addSpeakerNote = useCallback((speaker: "you" | "partner", text: string) => {
     if (!text || !text.trim()) return;
     const clean = text.trim();
-    const newNote: SpeakerNote = {
-      id: `${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-      speaker,
-      text: clean,
-      timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }),
-      timeMs: Date.now(),
-    };
-    setSpeakerNotes((prev) => [...prev, newNote]);
+    setSpeakerNotes((prev) => {
+      // Prevent rapid duplicates (within 3s with identical text)
+      if (prev.length > 0) {
+        const last = prev[prev.length - 1];
+        if (last.speaker === speaker && last.text.toLowerCase() === clean.toLowerCase() && Date.now() - last.timeMs < 3000) {
+          return prev;
+        }
+      }
+      const newNote: SpeakerNote = {
+        id: `${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+        speaker,
+        text: clean,
+        timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }),
+        timeMs: Date.now(),
+      };
+      return [...prev, newNote];
+    });
   }, []);
 
   // Copy all speaker notes formatted with timestamps
@@ -713,21 +722,39 @@ export default function VoiceEnhancementDashboard() {
     }
   }, [speakerNotes, autoScrollNotes]);
 
-  // Subtitle auto-fade after 7s of silence
+  // Subtitle auto-fade after 7s of silence unless speaking
   useEffect(() => {
     if (activeSubtitle && activeSubtitle.isFinal) {
       if (subtitleTimeoutRef.current) clearTimeout(subtitleTimeoutRef.current);
       subtitleTimeoutRef.current = setTimeout(() => {
-        setActiveSubtitle(null);
+        if (!telemetry.is_speaking) {
+          setActiveSubtitle(null);
+        }
       }, 7000);
     }
     return () => {
       if (subtitleTimeoutRef.current) clearTimeout(subtitleTimeoutRef.current);
     };
-  }, [activeSubtitle]);
+  }, [activeSubtitle, telemetry.is_speaking]);
 
-  // Web Speech API STT for local microphone ("You")
+  // Web Speech API STT for local microphone ("You") with resilient auto-recovery watchdog
+  const isRestartingRef = useRef<boolean>(false);
+
+  const scheduleRestart = useCallback((delayMs = 150) => {
+    if (!isProcessingRef.current || !subtitlesEnabledRef.current || isRestartingRef.current) {
+      return;
+    }
+    isRestartingRef.current = true;
+    setTimeout(() => {
+      isRestartingRef.current = false;
+      if (isProcessingRef.current && subtitlesEnabledRef.current) {
+        startSpeechRecognition();
+      }
+    }, delayMs);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
   const startSpeechRecognition = useCallback(() => {
+    if (typeof window === "undefined") return;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const w = window as any;
     const SpeechRecognition = w.SpeechRecognition || w.webkitSpeechRecognition;
@@ -737,88 +764,111 @@ export default function VoiceEnhancementDashboard() {
       return;
     }
 
+    // Safely abort previous instance if any
     if (recognitionRef.current) {
       try {
-        recognitionRef.current.stop();
+        recognitionRef.current.onresult = null;
+        recognitionRef.current.onerror = null;
+        recognitionRef.current.onend = null;
+        recognitionRef.current.abort();
       } catch {}
+      recognitionRef.current = null;
     }
-
-    const rec = new SpeechRecognition();
-    rec.continuous = true;
-    rec.interimResults = true;
-    rec.lang = subtitleLanguage;
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    rec.onresult = (event: any) => {
-      let interim = "";
-      let finalTranscript = "";
-      for (let i = event.resultIndex; i < event.results.length; ++i) {
-        const part = event.results[i][0].transcript;
-        if (event.results[i].isFinal) {
-          finalTranscript += part;
-        } else {
-          interim += part;
-        }
-      }
-
-      const activeSpeaker = manualSpeakerMode === "auto" ? "you" : manualSpeakerMode;
-
-      if (finalTranscript.trim()) {
-        const clean = finalTranscript.trim();
-        addSpeakerNote(activeSpeaker, clean);
-        setActiveSubtitle({
-          speaker: activeSpeaker,
-          text: clean,
-          interimText: "",
-          isFinal: true,
-          timestamp: Date.now(),
-        });
-      } else if (interim.trim()) {
-        setActiveSubtitle({
-          speaker: activeSpeaker,
-          text: "",
-          interimText: interim.trim(),
-          isFinal: false,
-          timestamp: Date.now(),
-        });
-      }
-    };
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    rec.onerror = (e: any) => {
-      if (e.error !== "no-speech") {
-        console.warn("Speech recognition warning:", e.error);
-      }
-    };
-
-    rec.onend = () => {
-      if (isProcessingRef.current && subtitlesEnabledRef.current) {
-        try {
-          rec.start();
-        } catch {}
-      }
-    };
 
     try {
+      const rec = new SpeechRecognition();
+      rec.continuous = true;
+      rec.interimResults = true;
+      rec.maxAlternatives = 1;
+      rec.lang = subtitleLanguage;
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      rec.onresult = (event: any) => {
+        let interim = "";
+        let finalTranscript = "";
+        for (let i = event.resultIndex; i < event.results.length; ++i) {
+          const item = event.results[i];
+          const part = item[0].transcript;
+          if (item.isFinal) {
+            finalTranscript += part;
+          } else {
+            interim += part;
+          }
+        }
+
+        const activeSpeaker = manualSpeakerMode === "auto" ? "you" : manualSpeakerMode;
+
+        if (finalTranscript.trim()) {
+          const clean = finalTranscript.trim();
+          addSpeakerNote(activeSpeaker, clean);
+          setActiveSubtitle({
+            speaker: activeSpeaker,
+            text: clean,
+            interimText: "",
+            isFinal: true,
+            timestamp: Date.now(),
+          });
+        } else if (interim.trim()) {
+          setActiveSubtitle({
+            speaker: activeSpeaker,
+            text: "",
+            interimText: interim.trim(),
+            isFinal: false,
+            timestamp: Date.now(),
+          });
+        }
+      };
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      rec.onerror = (e: any) => {
+        if (e.error === "no-speech") return;
+        console.warn("Speech recognition warning:", e.error);
+        if (e.error === "aborted" || e.error === "network") {
+          scheduleRestart(250);
+        }
+      };
+
+      rec.onend = () => {
+        // Crucial: Chrome closes the session after a few sentences.
+        // We MUST spawn a fresh new SpeechRecognition instance instead of reusing the ended one!
+        scheduleRestart(100);
+      };
+
       rec.start();
       recognitionRef.current = rec;
+      isRestartingRef.current = false;
     } catch (e) {
       console.warn("Could not start recognition:", e);
+      scheduleRestart(500);
     }
-  }, [subtitleLanguage, manualSpeakerMode, addSpeakerNote]);
+  }, [subtitleLanguage, manualSpeakerMode, addSpeakerNote, scheduleRestart]);
 
-  // Hook speech recognition lifecycle
+  // Hook speech recognition lifecycle & auto-healing watchdog
   useEffect(() => {
     if (isProcessing && subtitlesEnabled) {
       startSpeechRecognition();
     } else {
       if (recognitionRef.current) {
         try {
-          recognitionRef.current.stop();
+          recognitionRef.current.onresult = null;
+          recognitionRef.current.onerror = null;
+          recognitionRef.current.onend = null;
+          recognitionRef.current.abort();
         } catch {}
+        recognitionRef.current = null;
       }
     }
   }, [isProcessing, subtitlesEnabled, subtitleLanguage, startSpeechRecognition]);
+
+  // Active watchdog ensures recognition never stays dead
+  useEffect(() => {
+    const watchdog = setInterval(() => {
+      if (isProcessingRef.current && subtitlesEnabledRef.current && !recognitionRef.current && !isRestartingRef.current) {
+        startSpeechRecognition();
+      }
+    }, 3000);
+    return () => clearInterval(watchdog);
+  }, [startSpeechRecognition]);
 
   // Capture Meeting / Partner Audio Stream (DisplayMedia Audio)
   const startCapturePartnerAudio = async () => {
@@ -1418,6 +1468,16 @@ export default function VoiceEnhancementDashboard() {
                           {activeSubtitle.interimText ? (
                             <span className="subtitle-interim">{activeSubtitle.interimText}</span>
                           ) : null}
+                        </div>
+                      </div>
+                    ) : telemetry.is_speaking ? (
+                      <div className="subtitle-content">
+                        <div className="subtitle-speaker-badge you">
+                          <Mic style={{ width: 11, height: 11 }} /> You (Speaking)
+                        </div>
+                        <div className={`subtitle-text ${subtitleCinemaMode ? "large" : ""}`} style={{ color: "#cbd5e1", fontStyle: "italic", display: "flex", alignItems: "center", gap: 8 }}>
+                          <span style={{ display: "inline-block", width: 8, height: 8, borderRadius: "50%", background: "var(--accent-emerald)", boxShadow: "0 0 8px var(--accent-emerald)", animation: "pulse 1s infinite" }} />
+                          Voice detected... transcribing speech live
                         </div>
                       </div>
                     ) : (

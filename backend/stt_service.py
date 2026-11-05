@@ -114,3 +114,4 @@ class STTService:
 
 
 stt_service = STTService()
+

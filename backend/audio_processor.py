@@ -292,12 +292,9 @@ class AudioProcessor:
             # 4. Stage 2: Adaptive Spectral Subtraction (Continuous Fan / Hiss suppression)
             denoised = self._denoise_chunk(de_rumbled)
 
-            # Measure clean level for proximity gate decision
-            clean_rms = np.sqrt(np.mean(denoised ** 2) + 1e-9)
-            clean_db = float(20.0 * math.log10(max(clean_rms, 1e-4)))
-
             # 5. Stage 3: Close-Proximity Voice Gate (Mutes silence and residual background below threshold)
-            gated, gate_open = self._apply_proximity_voice_gate(denoised, clean_db)
+            # Uses microphone input level so the user's slider directly matches the input VU meter!
+            gated, gate_open = self._apply_proximity_voice_gate(denoised, self.input_level_db)
             
             # 6. Stage 4: Vocal Articulation & Consonant Formant Restoration
             articulated = self._apply_articulation_boost(gated)
@@ -305,7 +302,7 @@ class AudioProcessor:
             # 7. Stage 5: Gated AGC & Normalization
             out_chunk = self._apply_agc_and_gain(articulated, gate_open)
 
-            self.is_speaking = bool(gate_open and clean_rms > 0.012)
+            self.is_speaking = bool(gate_open and in_rms > 0.005)
 
         # Output telemetry
         out_rms = np.sqrt(np.mean(out_chunk ** 2) + 1e-9)
