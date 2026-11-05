@@ -122,7 +122,7 @@ export default function VoiceEnhancementDashboard() {
 
   // Voice Isolation & Traffic Filter
   const [gateEnabled, setGateEnabled] = useState<boolean>(true);
-  const [gateThresholdDb, setGateThresholdDb] = useState<number>(-34.0);
+  const [gateThresholdDb, setGateThresholdDb] = useState<number>(-48.0);
   const [trafficCutEnabled, setTrafficCutEnabled] = useState<boolean>(true);
 
   // Live telemetry
@@ -137,12 +137,21 @@ export default function VoiceEnhancementDashboard() {
     sample_rate: 16000,
   });
 
+  // Zero-latency local browser voice detection
+  const [isUserSpeakingLive, setIsUserSpeakingLive] = useState<boolean>(false);
+  const localVadSilenceTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
   // Live Subtitles & Speaker Notes states
   const [subtitlesEnabled, setSubtitlesEnabled] = useState<boolean>(true);
   const [subtitleCinemaMode, setSubtitleCinemaMode] = useState<boolean>(false);
   const [subtitleLanguage, setSubtitleLanguage] = useState<string>("en-US");
   const [manualSpeakerMode, setManualSpeakerMode] = useState<"auto" | "you" | "partner">("auto");
   const [activeSubtitle, setActiveSubtitle] = useState<ActiveSubtitle | null>(null);
+
+  // Continuous speech accumulation & note debounce
+  const activeUtteranceRef = useRef<string>("");
+  const committedIndexRef = useRef<number>(0);
+  const commitDebounceTimerRef = useRef<NodeJS.Timeout | null>(null);
 
   // Speaker Notes state
   const [speakerNotes, setSpeakerNotes] = useState<SpeakerNote[]>([]);
@@ -428,6 +437,22 @@ export default function VoiceEnhancementDashboard() {
         const inputData = e.inputBuffer.getChannelData(0);
         if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
           wsRef.current.send(inputData.buffer);
+        }
+
+        // Instant local zero-latency VAD (detects voice in browser in < 1ms)
+        let sumSq = 0;
+        for (let i = 0; i < inputData.length; i++) {
+          sumSq += inputData[i] * inputData[i];
+        }
+        const rms = Math.sqrt(sumSq / inputData.length);
+        if (rms > 0.0055) {
+          setIsUserSpeakingLive(true);
+          if (localVadSilenceTimeoutRef.current) {
+            clearTimeout(localVadSilenceTimeoutRef.current);
+          }
+          localVadSilenceTimeoutRef.current = setTimeout(() => {
+            setIsUserSpeakingLive(false);
+          }, 450);
         }
       };
 
@@ -784,39 +809,46 @@ export default function VoiceEnhancementDashboard() {
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       rec.onresult = (event: any) => {
-        let interim = "";
-        let finalTranscript = "";
-        for (let i = event.resultIndex; i < event.results.length; ++i) {
+        let currentInterim = "";
+        let newFinalized = "";
+
+        for (let i = committedIndexRef.current; i < event.results.length; ++i) {
           const item = event.results[i];
           const part = item[0].transcript;
           if (item.isFinal) {
-            finalTranscript += part;
+            newFinalized += part + " ";
           } else {
-            interim += part;
+            currentInterim += part;
           }
         }
 
         const activeSpeaker = manualSpeakerMode === "auto" ? "you" : manualSpeakerMode;
+        const currentSentence = (activeUtteranceRef.current + " " + newFinalized).trim();
 
-        if (finalTranscript.trim()) {
-          const clean = finalTranscript.trim();
-          addSpeakerNote(activeSpeaker, clean);
-          setActiveSubtitle({
-            speaker: activeSpeaker,
-            text: clean,
-            interimText: "",
-            isFinal: true,
-            timestamp: Date.now(),
-          });
-        } else if (interim.trim()) {
-          setActiveSubtitle({
-            speaker: activeSpeaker,
-            text: "",
-            interimText: interim.trim(),
-            isFinal: false,
-            timestamp: Date.now(),
-          });
+        // Update live subtitle immediately with real-time continuous typing
+        setActiveSubtitle({
+          speaker: activeSpeaker,
+          text: currentSentence,
+          interimText: currentInterim.trim(),
+          isFinal: false,
+          timestamp: Date.now(),
+        });
+
+        // Clear previous commit debounce timer
+        if (commitDebounceTimerRef.current) {
+          clearTimeout(commitDebounceTimerRef.current);
         }
+
+        // Commit full sentence to Speaker Notes after natural pause (1.2s silence)
+        commitDebounceTimerRef.current = setTimeout(() => {
+          const fullToCommit = (activeUtteranceRef.current + " " + newFinalized).trim();
+          if (fullToCommit) {
+            addSpeakerNote(activeSpeaker, fullToCommit);
+            activeUtteranceRef.current = "";
+            committedIndexRef.current = event.results.length;
+            setActiveSubtitle((prev) => (prev ? { ...prev, isFinal: true } : null));
+          }
+        }, 1200);
       };
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -824,14 +856,22 @@ export default function VoiceEnhancementDashboard() {
         if (e.error === "no-speech") return;
         console.warn("Speech recognition warning:", e.error);
         if (e.error === "aborted" || e.error === "network") {
-          scheduleRestart(250);
+          scheduleRestart(200);
         }
       };
 
       rec.onend = () => {
-        // Crucial: Chrome closes the session after a few sentences.
-        // We MUST spawn a fresh new SpeechRecognition instance instead of reusing the ended one!
-        scheduleRestart(100);
+        // Commit any pending uncommitted speech on session boundary
+        if (commitDebounceTimerRef.current) {
+          clearTimeout(commitDebounceTimerRef.current);
+        }
+        const activeSpeaker = manualSpeakerMode === "auto" ? "you" : manualSpeakerMode;
+        if (activeUtteranceRef.current.trim()) {
+          addSpeakerNote(activeSpeaker, activeUtteranceRef.current.trim());
+          activeUtteranceRef.current = "";
+        }
+        committedIndexRef.current = 0;
+        scheduleRestart(80);
       };
 
       rec.start();
@@ -1468,7 +1508,7 @@ export default function VoiceEnhancementDashboard() {
                   </div>
 
                   <div className="subtitle-body">
-                    {activeSubtitle ? (
+                    {activeSubtitle && (activeSubtitle.text || activeSubtitle.interimText) ? (
                       <div className="subtitle-content">
                         <div className={`subtitle-text ${subtitleCinemaMode ? "large" : ""}`}>
                           {activeSubtitle.text ? (
@@ -1477,22 +1517,29 @@ export default function VoiceEnhancementDashboard() {
                           {activeSubtitle.interimText ? (
                             <span className="subtitle-interim">{activeSubtitle.interimText}</span>
                           ) : null}
+                          <span className="subtitle-cursor" />
                         </div>
                       </div>
-                    ) : telemetry.is_speaking ? (
+                    ) : (isUserSpeakingLive || telemetry.is_speaking) ? (
                       <div className="subtitle-content">
-                        <div className="subtitle-speaker-badge you">
-                          <Mic style={{ width: 11, height: 11 }} /> You (Speaking)
+                        <div className="subtitle-speaker-badge you" style={{ marginBottom: 6 }}>
+                          <Mic style={{ width: 11, height: 11 }} /> You (Speaking Live)
                         </div>
-                        <div className={`subtitle-text ${subtitleCinemaMode ? "large" : ""}`} style={{ color: "#cbd5e1", fontStyle: "italic", display: "flex", alignItems: "center", gap: 8 }}>
-                          <span style={{ display: "inline-block", width: 8, height: 8, borderRadius: "50%", background: "var(--accent-emerald)", boxShadow: "0 0 8px var(--accent-emerald)", animation: "pulse 1s infinite" }} />
-                          Voice detected... transcribing speech live
+                        <div
+                          className={`subtitle-text ${subtitleCinemaMode ? "large" : ""}`}
+                          style={{ color: "#cbd5e1", display: "flex", alignItems: "center", gap: 10 }}
+                        >
+                          <span className="live-speech-pulse-dot" />
+                          <span style={{ fontStyle: "italic", opacity: 0.9 }}>
+                            Detecting voice... writing live subtitles
+                          </span>
+                          <span className="subtitle-cursor" />
                         </div>
                       </div>
                     ) : (
                       <div className="subtitle-idle">
-                        <Activity style={{ width: 14, height: 14, color: "var(--accent-indigo-light)", animation: "pulse 2s infinite" }} />
-                        <span>Awaiting speech... Speak into microphone or share meeting audio to see live subtitles.</span>
+                        <span className="live-runtime-active-dot" />
+                        <span>Continuous speech runtime active &bull; Listening instantly as you speak</span>
                       </div>
                     )}
                   </div>
@@ -1949,14 +1996,14 @@ export default function VoiceEnhancementDashboard() {
                 </div>
                 <input
                   type="range"
-                  min="-50"
-                  max="-22"
+                  min="-60"
+                  max="-20"
                   step="1"
                   value={gateThresholdDb}
                   onChange={(e) => setGateThresholdDb(parseFloat(e.target.value))}
                 />
                 <div className="slider-desc">
-                  Mutes distant chatter and street noise. Slide right if outside voices/vehicles are being heard.
+                  Mutes distant chatter and street noise. Default is -48 dB. Slide left (-55 dB) if quiet voice is cut; slide right (-35 dB) if background sounds leak in.
                 </div>
               </div>
 

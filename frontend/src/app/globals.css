@@ -686,9 +686,57 @@ input[type=range]::-webkit-slider-thumb:hover {
 }
 
 .subtitle-interim {
-  color: #94a3b8;
+  color: #93c5fd;
   font-style: italic;
-  opacity: 0.92;
+  opacity: 0.95;
+}
+
+.subtitle-cursor {
+  display: inline-block;
+  width: 2px;
+  height: 1.15em;
+  background: var(--accent-indigo-light);
+  margin-left: 4px;
+  vertical-align: -2px;
+  animation: cursorBlink 0.8s infinite;
+}
+
+@keyframes cursorBlink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+.live-speech-pulse-dot {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--accent-emerald);
+  box-shadow: 0 0 10px var(--accent-emerald);
+  animation: speechPulse 1s infinite ease-in-out;
+  flex-shrink: 0;
+}
+
+.live-runtime-active-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #3b82f6;
+  box-shadow: 0 0 8px rgba(59, 130, 246, 0.7);
+  animation: runtimePulse 2s infinite ease-in-out;
+  flex-shrink: 0;
+}
+
+@keyframes speechPulse {
+  0% { transform: scale(0.85); opacity: 0.7; }
+  50% { transform: scale(1.35); opacity: 1; }
+  100% { transform: scale(0.85); opacity: 0.7; }
+}
+
+@keyframes runtimePulse {
+  0%, 100% { opacity: 0.55; transform: scale(0.9); }
+  50% { opacity: 1; transform: scale(1.25); }
 }
 
 .subtitle-idle {
@@ -697,7 +745,7 @@ input[type=range]::-webkit-slider-thumb:hover {
   font-style: italic;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
 }
 
 /* Speaker Notes Section */

@@ -37,6 +37,7 @@ class AudioProcessor:
         # Gate envelope follower
         self._gate_gain: float = 0.0
         self._gate_hold_counter: int = 0
+        self._vad_hangover: int = 0
         
         # Audio filters setup
         self._setup_filters()
@@ -196,6 +197,7 @@ class AudioProcessor:
         """
         Close-Proximity Voice Expander / Gate:
         Suppresses distant chatter, fan residual, and room noise below threshold.
+        Opens instantly (0ms attack) so the very first word/syllable is never delayed or clipped.
         """
         if not self.settings.gate_enabled:
             return chunk, True
@@ -204,25 +206,29 @@ class AudioProcessor:
         is_above_thresh = current_db > thresh_db
 
         chunk_frames = len(chunk)
-        hold_frames = int(0.14 * (self.sample_rate / chunk_frames))  # ~140ms hold
+        # Hold gate open for 280ms to preserve trailing consonants and natural pauses between words
+        hold_frames = int(0.28 * (self.sample_rate / chunk_frames))
         
         if is_above_thresh:
-            target_gain = 1.0
             self._gate_hold_counter = hold_frames
+            # Instant attack (0ms latency): snap directly to full pass-through
+            self._gate_gain = 1.0
+            self.is_gate_open = True
+            return chunk, True
         else:
             if self._gate_hold_counter > 0:
                 self._gate_hold_counter -= 1
-                target_gain = 1.0
+                self._gate_gain = 1.0
+                self.is_gate_open = True
+                return chunk, True
             else:
-                target_gain = 0.0  # Completely mute residual noise when not speaking
-
-        # Fast attack (4ms), smooth release
-        rate = 0.85 if target_gain > self._gate_gain else 0.35
-        self._gate_gain = (1.0 - rate) * self._gate_gain + rate * target_gain
-        self.is_gate_open = bool(self._gate_gain > 0.05)
-
-        gated = chunk * self._gate_gain
-        return gated.astype(np.float32), self.is_gate_open
+                # Smooth release decay down to silence so there are no clicks or abrupt pops
+                self._gate_gain = 0.80 * self._gate_gain
+                if self._gate_gain < 0.01:
+                    self._gate_gain = 0.0
+                self.is_gate_open = False
+                gated = chunk * self._gate_gain
+                return gated.astype(np.float32), False
 
     def _apply_articulation_boost(self, chunk: np.ndarray) -> np.ndarray:
         """Boosts vocal clarity formants (2.8 kHz) for consonant intelligibility."""
@@ -283,7 +289,7 @@ class AudioProcessor:
         # 2. Check bypass
         if self.settings.bypass:
             out_chunk = chunk
-            self.is_speaking = bool(in_rms > 0.015)
+            gate_open = True
             self.is_gate_open = True
         else:
             # 3. Stage 1: Strip fan motor drone & low-frequency rumble (< 150 Hz)
@@ -302,7 +308,18 @@ class AudioProcessor:
             # 7. Stage 5: Gated AGC & Normalization
             out_chunk = self._apply_agc_and_gain(articulated, gate_open)
 
-            self.is_speaking = bool(gate_open and in_rms > 0.005)
+        # Voice Activity Detection (VAD) with 400ms hangover
+        # Voice is considered active if input level exceeds gate threshold OR raw RMS > 0.005
+        voice_active = (self.input_level_db > self.settings.gate_threshold_db) or (in_rms > 0.005)
+        chunk_frames = len(chunk)
+        if voice_active:
+            self._vad_hangover = int(0.40 * (self.sample_rate / chunk_frames))
+            self.is_speaking = True
+        elif self._vad_hangover > 0:
+            self._vad_hangover -= 1
+            self.is_speaking = True
+        else:
+            self.is_speaking = False
 
         # Output telemetry
         out_rms = np.sqrt(np.mean(out_chunk ** 2) + 1e-9)
