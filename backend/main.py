@@ -11,7 +11,7 @@ import time
 import json
 import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, UploadFile, File, Request
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, UploadFile, File, Form, Request
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -23,6 +23,7 @@ from audio_processor import audio_processor
 from device_manager import device_manager
 from prompts import PHONETIC_PROMPTS
 import dataset_prep
+from stt_service import stt_service
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("voice_enhancer.server")
@@ -95,6 +96,50 @@ async def stop_stream():
     """Stop the audio output stream."""
     audio_processor.stop_output_stream()
     return {"status": "stopped", "is_streaming": False}
+
+# ==================== SPEECH-TO-TEXT & LIVE SUBTITLES ENDPOINTS ====================
+
+@app.post("/api/stt/transcribe")
+async def transcribe_audio_endpoint(
+    file: UploadFile = File(...),
+    language: str = Form("en-US"),
+    speaker: str = Form("partner")
+):
+    """
+    Transcribes an incoming audio slice (from meeting partner stream or mic).
+    Returns recognized text with speaker attribution.
+    """
+    try:
+        content = await file.read()
+        res = stt_service.transcribe(content, language=language)
+        return {
+            "success": res.get("success", False),
+            "text": res.get("text", ""),
+            "speaker": speaker,
+            "language": language,
+            "error": res.get("error")
+        }
+    except Exception as e:
+        logger.error(f"Error in /api/stt/transcribe: {e}")
+        return {"success": False, "text": "", "speaker": speaker, "error": str(e)}
+
+@app.get("/api/stt/languages")
+async def get_stt_languages():
+    """Returns supported languages for real-time speech subtitles and notes."""
+    return {
+        "languages": [
+            {"code": "en-US", "name": "English (US)"},
+            {"code": "en-GB", "name": "English (UK)"},
+            {"code": "ur-PK", "name": "Urdu (Pakistan)"},
+            {"code": "hi-IN", "name": "Hindi (India)"},
+            {"code": "es-ES", "name": "Spanish (Spain)"},
+            {"code": "fr-FR", "name": "French"},
+            {"code": "de-DE", "name": "German"},
+            {"code": "ar-SA", "name": "Arabic (Saudi)"},
+            {"code": "zh-CN", "name": "Chinese (Mandarin)"},
+            {"code": "ja-JP", "name": "Japanese"}
+        ]
+    }
 
 # ==================== DATASET & MODEL PROFILE ENDPOINTS ====================
 

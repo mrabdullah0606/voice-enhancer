@@ -25,8 +25,35 @@ import {
   ChevronRight,
   ChevronLeft,
   FileAudio,
-  ShieldCheck
+  ShieldCheck,
+  MessageSquare,
+  Users,
+  Copy,
+  Trash2,
+  FileText,
+  Globe,
+  Maximize2,
+  Minimize2,
+  Share2,
+  StopCircle,
+  Search
 } from "lucide-react";
+
+export interface SpeakerNote {
+  id: string;
+  speaker: "you" | "partner";
+  text: string;
+  timestamp: string;
+  timeMs: number;
+}
+
+export interface ActiveSubtitle {
+  speaker: "you" | "partner";
+  text: string;
+  interimText?: string;
+  isFinal: boolean;
+  timestamp: number;
+}
 
 interface DeviceInfo {
   index: number;
@@ -109,6 +136,41 @@ export default function VoiceEnhancementDashboard() {
     streaming_active: false,
     sample_rate: 16000,
   });
+
+  // Live Subtitles & Speaker Notes states
+  const [subtitlesEnabled, setSubtitlesEnabled] = useState<boolean>(true);
+  const [subtitleCinemaMode, setSubtitleCinemaMode] = useState<boolean>(false);
+  const [subtitleLanguage, setSubtitleLanguage] = useState<string>("en-US");
+  const [manualSpeakerMode, setManualSpeakerMode] = useState<"auto" | "you" | "partner">("auto");
+  const [activeSubtitle, setActiveSubtitle] = useState<ActiveSubtitle | null>(null);
+
+  // Speaker Notes state
+  const [speakerNotes, setSpeakerNotes] = useState<SpeakerNote[]>([]);
+  const [notesFilter, setNotesFilter] = useState<"all" | "you" | "partner">("all");
+  const [autoScrollNotes, setAutoScrollNotes] = useState<boolean>(true);
+  const [copiedAll, setCopiedAll] = useState<boolean>(false);
+  const [notesSearch, setNotesSearch] = useState<string>("");
+
+  // Partner / Meeting Audio Stream
+  const [isPartnerCapturing, setIsPartnerCapturing] = useState<boolean>(false);
+  const partnerMediaStreamRef = useRef<MediaStream | null>(null);
+  const partnerAudioContextRef = useRef<AudioContext | null>(null);
+  const partnerAudioProcessorRef = useRef<ScriptProcessorNode | null>(null);
+
+  // Speech Recognition & Timers
+  const recognitionRef = useRef<any>(null);
+  const notesFeedEndRef = useRef<HTMLDivElement | null>(null);
+  const subtitleTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const isProcessingRef = useRef<boolean>(isProcessing);
+  const subtitlesEnabledRef = useRef<boolean>(subtitlesEnabled);
+
+  useEffect(() => {
+    isProcessingRef.current = isProcessing;
+  }, [isProcessing]);
+
+  useEffect(() => {
+    subtitlesEnabledRef.current = subtitlesEnabled;
+  }, [subtitlesEnabled]);
 
   // Dataset Studio state
   const [prompts, setPrompts] = useState<string[]>([]);
@@ -389,6 +451,12 @@ export default function VoiceEnhancementDashboard() {
   };
 
   const stopAudio = async () => {
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.stop();
+      } catch {}
+    }
+    stopCapturePartnerAudio();
     if (processorNodeRef.current) {
       processorNodeRef.current.disconnect();
       processorNodeRef.current = null;
@@ -514,6 +582,382 @@ export default function VoiceEnhancementDashboard() {
 
     return new Blob([view], { type: "audio/wav" });
   };
+
+  // Helper to encode Float32Array PCM chunks into genuine 16-bit PCM WAV (RIFF/WAVE)
+  const floatArrayToWavBlob = (channelData: Float32Array, sampleRate = 16000): Blob => {
+    const numChannels = 1;
+    const format = 1; // PCM
+    const bitDepth = 16;
+    const dataLength = channelData.length * 2;
+    const bufferLength = 44 + dataLength;
+    const arrayBuffer = new ArrayBuffer(bufferLength);
+    const view = new DataView(arrayBuffer);
+
+    const writeString = (offset: number, str: string) => {
+      for (let i = 0; i < str.length; i++) {
+        view.setUint8(offset + i, str.charCodeAt(i));
+      }
+    };
+
+    writeString(0, "RIFF");
+    view.setUint32(4, 36 + dataLength, true);
+    writeString(8, "WAVE");
+    writeString(12, "fmt ");
+    view.setUint32(16, 16, true);
+    view.setUint16(20, format, true);
+    view.setUint16(22, numChannels, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * numChannels * 2, true);
+    view.setUint16(32, numChannels * 2, true);
+    view.setUint16(34, bitDepth, true);
+    writeString(36, "data");
+    view.setUint32(40, dataLength, true);
+
+    let offset = 44;
+    for (let i = 0; i < channelData.length; i++, offset += 2) {
+      const s = Math.max(-1, Math.min(1, channelData[i]));
+      view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    }
+
+    return new Blob([view], { type: "audio/wav" });
+  };
+
+  // Add new finalized speaker note
+  const addSpeakerNote = useCallback((speaker: "you" | "partner", text: string) => {
+    if (!text || !text.trim()) return;
+    const clean = text.trim();
+    const newNote: SpeakerNote = {
+      id: `${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+      speaker,
+      text: clean,
+      timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }),
+      timeMs: Date.now(),
+    };
+    setSpeakerNotes((prev) => [...prev, newNote]);
+  }, []);
+
+  // Copy all speaker notes formatted with timestamps
+  const copyAllNotes = () => {
+    if (speakerNotes.length === 0) return;
+    const formatted = speakerNotes
+      .map((n) => `[${n.timestamp}] ${n.speaker === "you" ? "You" : "Partner"}: ${n.text}`)
+      .join("\n");
+    navigator.clipboard.writeText(formatted);
+    setCopiedAll(true);
+    setTimeout(() => setCopiedAll(false), 2000);
+  };
+
+  // Export transcript as Markdown or Plain Text
+  const exportNotes = (format: "md" | "txt" = "md") => {
+    if (speakerNotes.length === 0) return;
+    const now = new Date();
+    const dateStr = now.toLocaleDateString();
+    const timeStr = now.toLocaleTimeString();
+
+    let content = "";
+    if (format === "md") {
+      content = `# VoiceForge AI -- Meeting Transcript & Speaker Notes\n\n`;
+      content += `**Date:** ${dateStr} ${timeStr}\n`;
+      content += `**Total Notes:** ${speakerNotes.length} entries\n\n`;
+      content += `---\n\n`;
+      speakerNotes.forEach((n) => {
+        const badge = n.speaker === "you" ? "🔵 **You**" : "🟢 **Partner**";
+        content += `- \`[${n.timestamp}]\` ${badge}: ${n.text}\n\n`;
+      });
+    } else {
+      content = `VoiceForge AI -- Meeting Transcript\nDate: ${dateStr} ${timeStr}\nTotal Notes: ${speakerNotes.length}\n\n`;
+      speakerNotes.forEach((n) => {
+        content += `[${n.timestamp}] ${n.speaker === "you" ? "You" : "Partner"}: ${n.text}\n`;
+      });
+    }
+
+    const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `meeting_notes_${now.toISOString().slice(0, 10)}.${format}`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  // Clear speaker notes
+  const clearNotes = () => {
+    if (speakerNotes.length === 0) return;
+    if (confirm("Clear all speaker notes and transcript for this session?")) {
+      setSpeakerNotes([]);
+      setActiveSubtitle(null);
+    }
+  };
+
+  // Filtered speaker notes for UI
+  const filteredNotes = speakerNotes.filter((n) => {
+    const matchesFilter = notesFilter === "all" || n.speaker === notesFilter;
+    const matchesSearch =
+      !notesSearch ||
+      n.text.toLowerCase().includes(notesSearch.toLowerCase()) ||
+      n.speaker.toLowerCase().includes(notesSearch.toLowerCase());
+    return matchesFilter && matchesSearch;
+  });
+
+  const totalWords = speakerNotes.reduce(
+    (acc, n) => acc + n.text.split(/\s+/).filter(Boolean).length,
+    0
+  );
+
+  // Auto-scroll to latest note
+  useEffect(() => {
+    if (autoScrollNotes && notesFeedEndRef.current) {
+      notesFeedEndRef.current.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [speakerNotes, autoScrollNotes]);
+
+  // Subtitle auto-fade after 7s of silence
+  useEffect(() => {
+    if (activeSubtitle && activeSubtitle.isFinal) {
+      if (subtitleTimeoutRef.current) clearTimeout(subtitleTimeoutRef.current);
+      subtitleTimeoutRef.current = setTimeout(() => {
+        setActiveSubtitle(null);
+      }, 7000);
+    }
+    return () => {
+      if (subtitleTimeoutRef.current) clearTimeout(subtitleTimeoutRef.current);
+    };
+  }, [activeSubtitle]);
+
+  // Web Speech API STT for local microphone ("You")
+  const startSpeechRecognition = useCallback(() => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const w = window as any;
+    const SpeechRecognition = w.SpeechRecognition || w.webkitSpeechRecognition;
+
+    if (!SpeechRecognition) {
+      console.warn("Web Speech API not supported in this browser.");
+      return;
+    }
+
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.stop();
+      } catch {}
+    }
+
+    const rec = new SpeechRecognition();
+    rec.continuous = true;
+    rec.interimResults = true;
+    rec.lang = subtitleLanguage;
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    rec.onresult = (event: any) => {
+      let interim = "";
+      let finalTranscript = "";
+      for (let i = event.resultIndex; i < event.results.length; ++i) {
+        const part = event.results[i][0].transcript;
+        if (event.results[i].isFinal) {
+          finalTranscript += part;
+        } else {
+          interim += part;
+        }
+      }
+
+      const activeSpeaker = manualSpeakerMode === "auto" ? "you" : manualSpeakerMode;
+
+      if (finalTranscript.trim()) {
+        const clean = finalTranscript.trim();
+        addSpeakerNote(activeSpeaker, clean);
+        setActiveSubtitle({
+          speaker: activeSpeaker,
+          text: clean,
+          interimText: "",
+          isFinal: true,
+          timestamp: Date.now(),
+        });
+      } else if (interim.trim()) {
+        setActiveSubtitle({
+          speaker: activeSpeaker,
+          text: "",
+          interimText: interim.trim(),
+          isFinal: false,
+          timestamp: Date.now(),
+        });
+      }
+    };
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    rec.onerror = (e: any) => {
+      if (e.error !== "no-speech") {
+        console.warn("Speech recognition warning:", e.error);
+      }
+    };
+
+    rec.onend = () => {
+      if (isProcessingRef.current && subtitlesEnabledRef.current) {
+        try {
+          rec.start();
+        } catch {}
+      }
+    };
+
+    try {
+      rec.start();
+      recognitionRef.current = rec;
+    } catch (e) {
+      console.warn("Could not start recognition:", e);
+    }
+  }, [subtitleLanguage, manualSpeakerMode, addSpeakerNote]);
+
+  // Hook speech recognition lifecycle
+  useEffect(() => {
+    if (isProcessing && subtitlesEnabled) {
+      startSpeechRecognition();
+    } else {
+      if (recognitionRef.current) {
+        try {
+          recognitionRef.current.stop();
+        } catch {}
+      }
+    }
+  }, [isProcessing, subtitlesEnabled, subtitleLanguage, startSpeechRecognition]);
+
+  // Capture Meeting / Partner Audio Stream (DisplayMedia Audio)
+  const startCapturePartnerAudio = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getDisplayMedia({
+        video: true,
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+        } as MediaTrackConstraints,
+      });
+
+      const audioTracks = stream.getAudioTracks();
+      if (audioTracks.length === 0) {
+        alert("No audio track detected! Please make sure to check 'Share tab audio' or 'Share system audio' in the browser prompt.");
+        stream.getTracks().forEach((t) => t.stop());
+        return;
+      }
+
+      partnerMediaStreamRef.current = stream;
+      setIsPartnerCapturing(true);
+
+      const pCtx = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
+      partnerAudioContextRef.current = pCtx;
+      const pSource = pCtx.createMediaStreamSource(stream);
+      const pProcessor = pCtx.createScriptProcessor(2048, 1, 1);
+      partnerAudioProcessorRef.current = pProcessor;
+
+      let partnerBuffer: Float32Array[] = [];
+      let isPartnerSpeakingNow = false;
+      let silenceChunks = 0;
+
+      pProcessor.onaudioprocess = async (e) => {
+        const data = e.inputBuffer.getChannelData(0);
+        let sumSq = 0;
+        for (let i = 0; i < data.length; i++) {
+          sumSq += data[i] * data[i];
+        }
+        const rms = Math.sqrt(sumSq / data.length);
+        const isVoice = rms > 0.015;
+
+        if (isVoice) {
+          isPartnerSpeakingNow = true;
+          silenceChunks = 0;
+          partnerBuffer.push(new Float32Array(data));
+          setActiveSubtitle((prev) => {
+            if (!prev || prev.speaker !== "partner" || prev.isFinal) {
+              return {
+                speaker: "partner",
+                text: "",
+                interimText: "Listening to partner...",
+                isFinal: false,
+                timestamp: Date.now(),
+              };
+            }
+            return prev;
+          });
+        } else if (isPartnerSpeakingNow) {
+          partnerBuffer.push(new Float32Array(data));
+          silenceChunks++;
+          if (silenceChunks >= 5 || partnerBuffer.length > 40) {
+            isPartnerSpeakingNow = false;
+            silenceChunks = 0;
+            const totalLen = partnerBuffer.reduce((a, c) => a + c.length, 0);
+            if (totalLen > 7000) {
+              const merged = new Float32Array(totalLen);
+              let off = 0;
+              for (const c of partnerBuffer) {
+                merged.set(c, off);
+                off += c.length;
+              }
+              const wavBlob = floatArrayToWavBlob(merged, pCtx.sampleRate || 16000);
+              partnerBuffer = [];
+
+              try {
+                const fd = new FormData();
+                fd.append("file", wavBlob, "partner.wav");
+                fd.append("language", subtitleLanguage);
+                fd.append("speaker", "partner");
+                const res = await fetch("http://127.0.0.1:8000/api/stt/transcribe", {
+                  method: "POST",
+                  body: fd,
+                });
+                if (res.ok) {
+                  const resData = await res.json();
+                  if (resData.text && resData.text.trim()) {
+                    const clean = resData.text.trim();
+                    addSpeakerNote("partner", clean);
+                    setActiveSubtitle({
+                      speaker: "partner",
+                      text: clean,
+                      interimText: "",
+                      isFinal: true,
+                      timestamp: Date.now(),
+                    });
+                  }
+                }
+              } catch (err) {
+                console.warn("Failed partner transcription:", err);
+              }
+            } else {
+              partnerBuffer = [];
+            }
+          }
+        }
+      };
+
+      const pSilent = pCtx.createGain();
+      pSilent.gain.value = 0;
+      pSource.connect(pProcessor);
+      pProcessor.connect(pSilent);
+      pSilent.connect(pCtx.destination);
+
+      stream.getVideoTracks().forEach((t) => {
+        t.onended = () => stopCapturePartnerAudio();
+      });
+      audioTracks[0].onended = () => stopCapturePartnerAudio();
+    } catch (err) {
+      console.warn("Meeting audio share cancelled or error:", err);
+      setIsPartnerCapturing(false);
+    }
+  };
+
+  const stopCapturePartnerAudio = useCallback(() => {
+    if (partnerAudioProcessorRef.current) {
+      partnerAudioProcessorRef.current.disconnect();
+      partnerAudioProcessorRef.current = null;
+    }
+    if (partnerMediaStreamRef.current) {
+      partnerMediaStreamRef.current.getTracks().forEach((t) => t.stop());
+      partnerMediaStreamRef.current = null;
+    }
+    if (partnerAudioContextRef.current) {
+      partnerAudioContextRef.current.close();
+      partnerAudioContextRef.current = null;
+    }
+    setIsPartnerCapturing(false);
+  }, []);
 
   // Dataset prompt recording functions
   const startRecordingPrompt = async () => {
@@ -885,6 +1329,306 @@ export default function VoiceEnhancementDashboard() {
                   {monitorAudio ? "Headphone Monitor: On" : "Headphone Monitor: Muted"}
                 </button>
               </div>
+
+              {/* LIVE ON-SCREEN SUBTITLES */}
+              {subtitlesEnabled && (
+                <div className={`subtitle-container ${subtitleCinemaMode ? "cinema" : ""}`}>
+                  <div className="subtitle-header">
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <MessageSquare style={{ width: 14, height: 14, color: "var(--accent-indigo-light)" }} />
+                      <strong style={{ color: "#fff", fontSize: "0.78rem" }}>Live Subtitles & Closed Captions</strong>
+                      {activeSubtitle ? (
+                        <span
+                          className={`subtitle-speaker-badge ${activeSubtitle.speaker}`}
+                          style={{ marginLeft: 4 }}
+                        >
+                          {activeSubtitle.speaker === "you" ? (
+                            <>
+                              <Mic style={{ width: 11, height: 11 }} /> You
+                            </>
+                          ) : (
+                            <>
+                              <Users style={{ width: 11, height: 11 }} /> Partner
+                            </>
+                          )}
+                        </span>
+                      ) : null}
+                    </div>
+
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      {/* Language Selector */}
+                      <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                        <Globe style={{ width: 12, height: 12, color: "var(--text-subtle)" }} />
+                        <select
+                          value={subtitleLanguage}
+                          onChange={(e) => setSubtitleLanguage(e.target.value)}
+                          style={{
+                            background: "rgba(0,0,0,0.5)",
+                            border: "1px solid var(--border-color)",
+                            borderRadius: 4,
+                            color: "var(--text-main)",
+                            fontSize: "0.68rem",
+                            padding: "2px 6px",
+                            cursor: "pointer",
+                          }}
+                        >
+                          <option value="en-US">English (US)</option>
+                          <option value="en-GB">English (UK)</option>
+                          <option value="ur-PK">Urdu</option>
+                          <option value="hi-IN">Hindi</option>
+                          <option value="es-ES">Spanish</option>
+                          <option value="fr-FR">French</option>
+                          <option value="de-DE">German</option>
+                          <option value="ar-SA">Arabic</option>
+                          <option value="zh-CN">Chinese</option>
+                        </select>
+                      </div>
+
+                      {/* Cinema mode toggle */}
+                      <button
+                        onClick={() => setSubtitleCinemaMode(!subtitleCinemaMode)}
+                        className="btn-secondary"
+                        style={{ padding: "3px 6px", fontSize: "0.68rem" }}
+                        title={subtitleCinemaMode ? "Normal Subtitle Size" : "Cinema Large Size"}
+                      >
+                        {subtitleCinemaMode ? (
+                          <Minimize2 style={{ width: 12, height: 12 }} />
+                        ) : (
+                          <Maximize2 style={{ width: 12, height: 12 }} />
+                        )}
+                      </button>
+
+                      <button
+                        onClick={() => setSubtitlesEnabled(!subtitlesEnabled)}
+                        className="btn-secondary"
+                        style={{ padding: "3px 8px", fontSize: "0.68rem" }}
+                      >
+                        Hide
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="subtitle-body">
+                    {activeSubtitle ? (
+                      <div className="subtitle-content">
+                        <div className={`subtitle-text ${subtitleCinemaMode ? "large" : ""}`}>
+                          {activeSubtitle.text ? (
+                            <span>{activeSubtitle.text} </span>
+                          ) : null}
+                          {activeSubtitle.interimText ? (
+                            <span className="subtitle-interim">{activeSubtitle.interimText}</span>
+                          ) : null}
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="subtitle-idle">
+                        <Activity style={{ width: 14, height: 14, color: "var(--accent-indigo-light)", animation: "pulse 2s infinite" }} />
+                        <span>Awaiting speech... Speak into microphone or share meeting audio to see live subtitles.</span>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* SPEAKER NOTES & MEETING TRANSCRIPT CARD */}
+            <div className="glass-panel notes-panel" style={{ padding: 20 }}>
+              <div className="notes-header-bar">
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <div
+                    style={{
+                      width: 32,
+                      height: 32,
+                      borderRadius: "var(--radius-sm)",
+                      background: "linear-gradient(135deg, var(--accent-indigo), var(--accent-violet))",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                    }}
+                  >
+                    <FileText style={{ width: 16, height: 16, color: "#fff" }} />
+                  </div>
+                  <div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <span style={{ fontWeight: 700, fontSize: "0.95rem", color: "#fff" }}>
+                        Live Speaker Notes & Transcript
+                      </span>
+                      <span className="badge-tag" style={{ fontSize: "0.68rem" }}>
+                        {speakerNotes.length} notes &bull; {totalWords} words
+                      </span>
+                    </div>
+                    <div style={{ fontSize: "0.72rem", color: "var(--text-subtle)", marginTop: 2 }}>
+                      Spoken words from you and the other person automatically recorded with timestamps.
+                    </div>
+                  </div>
+                </div>
+
+                {/* Action buttons */}
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <button
+                    onClick={copyAllNotes}
+                    disabled={speakerNotes.length === 0}
+                    className="btn-secondary"
+                    style={{ padding: "5px 10px", fontSize: "0.72rem" }}
+                    title="Copy all notes formatted to clipboard"
+                  >
+                    {copiedAll ? (
+                      <>
+                        <Check style={{ width: 12, height: 12, color: "var(--accent-emerald)" }} />
+                        Copied!
+                      </>
+                    ) : (
+                      <>
+                        <Copy style={{ width: 12, height: 12 }} />
+                        Copy All
+                      </>
+                    )}
+                  </button>
+
+                  <button
+                    onClick={() => exportNotes("md")}
+                    disabled={speakerNotes.length === 0}
+                    className="btn-secondary"
+                    style={{ padding: "5px 10px", fontSize: "0.72rem" }}
+                    title="Export Markdown file (.md)"
+                  >
+                    <Download style={{ width: 12, height: 12 }} />
+                    Export (.md)
+                  </button>
+
+                  <button
+                    onClick={clearNotes}
+                    disabled={speakerNotes.length === 0}
+                    className="btn-secondary"
+                    style={{ padding: "5px 8px", fontSize: "0.72rem" }}
+                    title="Clear transcript"
+                  >
+                    <Trash2 style={{ width: 12, height: 12, color: "var(--accent-rose)" }} />
+                  </button>
+                </div>
+              </div>
+
+              {/* Filter and Search Bar */}
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+                <div className="notes-filter-pills">
+                  <button
+                    onClick={() => setNotesFilter("all")}
+                    className={`filter-pill ${notesFilter === "all" ? "active" : ""}`}
+                  >
+                    All Speakers ({speakerNotes.length})
+                  </button>
+                  <button
+                    onClick={() => setNotesFilter("you")}
+                    className={`filter-pill ${notesFilter === "you" ? "active" : ""}`}
+                  >
+                    You ({speakerNotes.filter((n) => n.speaker === "you").length})
+                  </button>
+                  <button
+                    onClick={() => setNotesFilter("partner")}
+                    className={`filter-pill ${notesFilter === "partner" ? "active" : ""}`}
+                  >
+                    Partner ({speakerNotes.filter((n) => n.speaker === "partner").length})
+                  </button>
+                </div>
+
+                <div style={{ display: "flex", alignItems: "center", gap: 6, position: "relative" }}>
+                  <Search style={{ width: 12, height: 12, color: "var(--text-subtle)", position: "absolute", left: 8 }} />
+                  <input
+                    type="text"
+                    placeholder="Search notes..."
+                    value={notesSearch}
+                    onChange={(e) => setNotesSearch(e.target.value)}
+                    style={{
+                      background: "rgba(0,0,0,0.4)",
+                      border: "1px solid var(--border-color)",
+                      borderRadius: "var(--radius-sm)",
+                      padding: "4px 8px 4px 26px",
+                      fontSize: "0.72rem",
+                      color: "var(--text-main)",
+                      width: 140,
+                    }}
+                  />
+                  {notesSearch && (
+                    <button
+                      onClick={() => setNotesSearch("")}
+                      style={{ background: "transparent", border: "none", color: "var(--text-subtle)", cursor: "pointer", fontSize: "0.7rem" }}
+                    >
+                      &times;
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {/* Notes Feed */}
+              <div className="notes-feed-container">
+                {filteredNotes.length === 0 ? (
+                  <div className="notes-empty">
+                    <FileText style={{ width: 28, height: 28, color: "var(--text-subtle)", opacity: 0.5 }} />
+                    <div style={{ fontWeight: 600, color: "var(--text-muted)", fontSize: "0.85rem" }}>
+                      {notesSearch ? "No matching speaker notes found" : "No Speaker Notes Recorded Yet"}
+                    </div>
+                    <div style={{ fontSize: "0.72rem", maxWidth: 380, lineHeight: 1.5 }}>
+                      Click <strong>&quot;Engage Engine&quot;</strong> to transcribe your voice, or click <strong>&quot;Share Meeting Audio&quot;</strong> to capture and log the other person&apos;s speech live!
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    {filteredNotes.map((note) => (
+                      <div key={note.id} className={`note-item ${note.speaker}`}>
+                        <div className={`note-avatar-wrapper ${note.speaker}`}>
+                          {note.speaker === "you" ? (
+                            <Mic style={{ width: 14, height: 14 }} />
+                          ) : (
+                            <Users style={{ width: 14, height: 14 }} />
+                          )}
+                        </div>
+
+                        <div className="note-content-body">
+                          <div className="note-meta">
+                            <span className={`note-speaker-name ${note.speaker}`}>
+                              {note.speaker === "you" ? "You (Microphone)" : "Partner (Meeting Audio)"}
+                            </span>
+                            <span className="note-timestamp">{note.timestamp}</span>
+                          </div>
+                          <div className="note-text-body">{note.text}</div>
+                        </div>
+
+                        <button
+                          onClick={() => {
+                            navigator.clipboard.writeText(note.text);
+                          }}
+                          className="btn-secondary"
+                          style={{ alignSelf: "flex-start", padding: "4px 6px", opacity: 0.6 }}
+                          title="Copy this note"
+                        >
+                          <Copy style={{ width: 10, height: 10 }} />
+                        </button>
+                      </div>
+                    ))}
+
+                    {/* Live in-progress preview if active */}
+                    {activeSubtitle && activeSubtitle.interimText && (
+                      <div className={`note-item ${activeSubtitle.speaker}`} style={{ opacity: 0.75, borderStyle: "dashed" }}>
+                        <div className={`note-avatar-wrapper ${activeSubtitle.speaker}`}>
+                          <Activity style={{ width: 14, height: 14, animation: "pulse 1s infinite" }} />
+                        </div>
+                        <div className="note-content-body">
+                          <div className="note-meta">
+                            <span className={`note-speaker-name ${activeSubtitle.speaker}`}>
+                              {activeSubtitle.speaker === "you" ? "You (Speaking now...)" : "Partner (Speaking now...)"}
+                            </span>
+                            <span className="note-timestamp" style={{ fontStyle: "italic" }}>live</span>
+                          </div>
+                          <div className="note-text-body" style={{ fontStyle: "italic", color: "#94a3b8" }}>
+                            {activeSubtitle.interimText}
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                    <div ref={notesFeedEndRef} />
+                  </>
+                )}
+              </div>
             </div>
 
             {/* Conversational Latency Budget */}
@@ -994,6 +1738,100 @@ export default function VoiceEnhancementDashboard() {
                 </select>
                 <div style={{ fontSize: "0.7rem", color: "var(--text-subtle)", marginTop: 2 }}>
                   Route into VB-CABLE Input, then select VB-CABLE Output in Zoom/Teams.
+                </div>
+              </div>
+
+              {/* Meeting / Partner Audio (The Next Person) */}
+              <div className="partner-connect-box" style={{ marginTop: 14 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <span style={{ fontSize: "0.78rem", fontWeight: 700, color: "#fff", display: "flex", alignItems: "center", gap: 6 }}>
+                    <Users style={{ width: 14, height: 14, color: "var(--accent-emerald)" }} />
+                    Partner Audio (The Next Person)
+                  </span>
+
+                  {isPartnerCapturing && (
+                    <span style={{ fontSize: "0.68rem", fontWeight: 700, color: "#6ee7b7", background: "rgba(16,185,129,0.2)", padding: "2px 8px", borderRadius: 9999, border: "1px solid rgba(16,185,129,0.4)" }}>
+                      ● Meeting Audio Connected
+                    </span>
+                  )}
+                </div>
+
+                <div style={{ fontSize: "0.7rem", color: "var(--text-subtle)", lineHeight: 1.4 }}>
+                  Capture incoming audio from Zoom, Microsoft Teams, Google Meet, or browser tabs for instant partner subtitles and speaker notes.
+                </div>
+
+                <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
+                  {isPartnerCapturing ? (
+                    <button
+                      onClick={stopCapturePartnerAudio}
+                      className="btn-primary btn-danger"
+                      style={{ width: "100%", justifyContent: "center", padding: "8px 12px", fontSize: "0.75rem" }}
+                    >
+                      <StopCircle style={{ width: 14, height: 14 }} />
+                      Disconnect Partner Audio
+                    </button>
+                  ) : (
+                    <button
+                      onClick={startCapturePartnerAudio}
+                      className="btn-primary"
+                      style={{ width: "100%", justifyContent: "center", padding: "8px 12px", fontSize: "0.75rem", background: "linear-gradient(135deg, var(--accent-emerald), #059669)" }}
+                    >
+                      <Share2 style={{ width: 14, height: 14 }} />
+                      Share Meeting / Tab Audio
+                    </button>
+                  )}
+                </div>
+
+                {/* Speaker Attribution Test Switcher */}
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", paddingTop: 6, borderTop: "1px solid rgba(255,255,255,0.06)", marginTop: 6, fontSize: "0.7rem" }}>
+                  <span style={{ color: "var(--text-subtle)" }}>Speaker Attribution:</span>
+                  <div style={{ display: "flex", gap: 4 }}>
+                    <button
+                      onClick={() => setManualSpeakerMode("auto")}
+                      style={{
+                        padding: "2px 8px",
+                        fontSize: "0.68rem",
+                        borderRadius: 4,
+                        border: "1px solid",
+                        background: manualSpeakerMode === "auto" ? "var(--accent-indigo)" : "transparent",
+                        borderColor: manualSpeakerMode === "auto" ? "var(--accent-indigo)" : "var(--border-color)",
+                        color: "#fff",
+                        cursor: "pointer",
+                      }}
+                    >
+                      Auto
+                    </button>
+                    <button
+                      onClick={() => setManualSpeakerMode("you")}
+                      style={{
+                        padding: "2px 8px",
+                        fontSize: "0.68rem",
+                        borderRadius: 4,
+                        border: "1px solid",
+                        background: manualSpeakerMode === "you" ? "rgba(99,102,241,0.3)" : "transparent",
+                        borderColor: manualSpeakerMode === "you" ? "var(--accent-indigo)" : "var(--border-color)",
+                        color: "#818cf8",
+                        cursor: "pointer",
+                      }}
+                    >
+                      You
+                    </button>
+                    <button
+                      onClick={() => setManualSpeakerMode("partner")}
+                      style={{
+                        padding: "2px 8px",
+                        fontSize: "0.68rem",
+                        borderRadius: 4,
+                        border: "1px solid",
+                        background: manualSpeakerMode === "partner" ? "rgba(16,185,129,0.3)" : "transparent",
+                        borderColor: manualSpeakerMode === "partner" ? "var(--accent-emerald)" : "var(--border-color)",
+                        color: "#6ee7b7",
+                        cursor: "pointer",
+                      }}
+                    >
+                      Partner
+                    </button>
+                  </div>
                 </div>
               </div>
             </div>
