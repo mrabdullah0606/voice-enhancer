@@ -1378,10 +1378,18 @@ export default function VoiceEnhancementDashboard() {
                   )}
                   {monitorAudio ? "Headphone Monitor: On" : "Headphone Monitor: Muted"}
                 </button>
+
+                <button
+                  onClick={() => setSubtitlesEnabled(!subtitlesEnabled)}
+                  className={`btn-secondary ${subtitlesEnabled ? "active" : ""}`}
+                >
+                  <MessageSquare style={{ width: 14, height: 14, color: subtitlesEnabled ? "var(--accent-indigo-light)" : "inherit" }} />
+                  {subtitlesEnabled ? "Subtitles: Visible" : "Subtitles: Hidden"}
+                </button>
               </div>
 
               {/* LIVE ON-SCREEN SUBTITLES */}
-              {subtitlesEnabled && (
+              {subtitlesEnabled ? (
                 <div className={`subtitle-container ${subtitleCinemaMode ? "cinema" : ""}`}>
                   <div className="subtitle-header">
                     <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
@@ -1449,9 +1457,10 @@ export default function VoiceEnhancementDashboard() {
                       </button>
 
                       <button
-                        onClick={() => setSubtitlesEnabled(!subtitlesEnabled)}
+                        onClick={() => setSubtitlesEnabled(false)}
                         className="btn-secondary"
                         style={{ padding: "3px 8px", fontSize: "0.68rem" }}
+                        title="Hide subtitle box"
                       >
                         Hide
                       </button>
@@ -1487,6 +1496,20 @@ export default function VoiceEnhancementDashboard() {
                       </div>
                     )}
                   </div>
+                </div>
+              ) : (
+                <div style={{ marginTop: 14, padding: "10px 16px", borderRadius: "var(--radius-md)", background: "rgba(255,255,255,0.02)", border: "1px dashed var(--border-color)", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <span style={{ fontSize: "0.75rem", color: "var(--text-subtle)", display: "flex", alignItems: "center", gap: 8 }}>
+                    <MessageSquare style={{ width: 14, height: 14 }} />
+                    Subtitles & Closed Captions are currently hidden.
+                  </span>
+                  <button
+                    onClick={() => setSubtitlesEnabled(true)}
+                    className="btn-secondary"
+                    style={{ padding: "4px 12px", fontSize: "0.72rem", background: "rgba(99, 102, 241, 0.15)", borderColor: "rgba(99, 102, 241, 0.4)", color: "#fff" }}
+                  >
+                    Unhide Subtitles
+                  </button>
                 </div>
               )}
             </div>
