@@ -169,7 +169,6 @@ export default function VoiceEnhancementDashboard() {
   // Speech Recognition & Timers
   const recognitionRef = useRef<any>(null);
   const notesFeedEndRef = useRef<HTMLDivElement | null>(null);
-  const subtitleTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const isProcessingRef = useRef<boolean>(isProcessing);
   const subtitlesEnabledRef = useRef<boolean>(subtitlesEnabled);
 
@@ -747,31 +746,20 @@ export default function VoiceEnhancementDashboard() {
     }
   }, [speakerNotes, autoScrollNotes]);
 
-  // Subtitle auto-fade after 7s of silence unless speaking
-  useEffect(() => {
-    if (activeSubtitle && activeSubtitle.isFinal) {
-      if (subtitleTimeoutRef.current) clearTimeout(subtitleTimeoutRef.current);
-      subtitleTimeoutRef.current = setTimeout(() => {
-        if (!telemetry.is_speaking) {
-          setActiveSubtitle(null);
-        }
-      }, 7000);
-    }
-    return () => {
-      if (subtitleTimeoutRef.current) clearTimeout(subtitleTimeoutRef.current);
-    };
-  }, [activeSubtitle, telemetry.is_speaking]);
+  // Timers and health tracking for continuous uninterrupted STT
+  const restartTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const subtitleFadeTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const lastSpeechResultTimeRef = useRef<number>(0);
+  const sessionStartTimeRef = useRef<number>(0);
+  const pendingFinalRef = useRef<string>("");
 
-  // Web Speech API STT for local microphone ("You") with resilient auto-recovery watchdog
-  const isRestartingRef = useRef<boolean>(false);
-
-  const scheduleRestart = useCallback((delayMs = 150) => {
-    if (!isProcessingRef.current || !subtitlesEnabledRef.current || isRestartingRef.current) {
-      return;
+  const scheduleRestart = useCallback((delayMs = 120) => {
+    if (!isProcessingRef.current || !subtitlesEnabledRef.current) return;
+    if (restartTimerRef.current) {
+      clearTimeout(restartTimerRef.current);
     }
-    isRestartingRef.current = true;
-    setTimeout(() => {
-      isRestartingRef.current = false;
+    restartTimerRef.current = setTimeout(() => {
+      restartTimerRef.current = null;
       if (isProcessingRef.current && subtitlesEnabledRef.current) {
         startSpeechRecognition();
       }
@@ -789,13 +777,14 @@ export default function VoiceEnhancementDashboard() {
       return;
     }
 
-    // Safely abort previous instance if any
+    // Safely tear down old recognition instance
     if (recognitionRef.current) {
       try {
-        recognitionRef.current.onresult = null;
-        recognitionRef.current.onerror = null;
-        recognitionRef.current.onend = null;
-        recognitionRef.current.abort();
+        const old = recognitionRef.current;
+        old.onresult = null;
+        old.onerror = null;
+        old.onend = null;
+        old.abort();
       } catch {}
       recognitionRef.current = null;
     }
@@ -807,8 +796,12 @@ export default function VoiceEnhancementDashboard() {
       rec.maxAlternatives = 1;
       rec.lang = subtitleLanguage;
 
+      sessionStartTimeRef.current = Date.now();
+      lastSpeechResultTimeRef.current = Date.now();
+
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       rec.onresult = (event: any) => {
+        lastSpeechResultTimeRef.current = Date.now();
         let currentInterim = "";
         let newFinalized = "";
 
@@ -823,7 +816,14 @@ export default function VoiceEnhancementDashboard() {
         }
 
         const activeSpeaker = manualSpeakerMode === "auto" ? "you" : manualSpeakerMode;
+        pendingFinalRef.current = newFinalized;
         const currentSentence = (activeUtteranceRef.current + " " + newFinalized).trim();
+
+        // Cancel pending subtitle fadeout because speech is active
+        if (subtitleFadeTimerRef.current) {
+          clearTimeout(subtitleFadeTimerRef.current);
+          subtitleFadeTimerRef.current = null;
+        }
 
         // Update live subtitle immediately with real-time continuous typing
         setActiveSubtitle({
@@ -841,23 +841,43 @@ export default function VoiceEnhancementDashboard() {
 
         // Commit full sentence to Speaker Notes after natural pause (1.2s silence)
         commitDebounceTimerRef.current = setTimeout(() => {
-          const fullToCommit = (activeUtteranceRef.current + " " + newFinalized).trim();
+          const fullToCommit = (activeUtteranceRef.current + " " + pendingFinalRef.current).trim();
           if (fullToCommit) {
             addSpeakerNote(activeSpeaker, fullToCommit);
             activeUtteranceRef.current = "";
+            pendingFinalRef.current = "";
             committedIndexRef.current = event.results.length;
-            setActiveSubtitle((prev) => (prev ? { ...prev, isFinal: true } : null));
+
+            setActiveSubtitle({
+              speaker: activeSpeaker,
+              text: fullToCommit,
+              interimText: "",
+              isFinal: true,
+              timestamp: Date.now(),
+            });
+
+            // Cleanly fade out subtitle after 3.5s of silence back to ready state
+            if (subtitleFadeTimerRef.current) clearTimeout(subtitleFadeTimerRef.current);
+            subtitleFadeTimerRef.current = setTimeout(() => {
+              setActiveSubtitle((curr) => {
+                if (curr && curr.isFinal && curr.text === fullToCommit) {
+                  return null;
+                }
+                return curr;
+              });
+            }, 3500);
           }
         }, 1200);
       };
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       rec.onerror = (e: any) => {
-        if (e.error === "no-speech") return;
-        console.warn("Speech recognition warning:", e.error);
-        if (e.error === "aborted" || e.error === "network") {
-          scheduleRestart(200);
+        // Any error in Chrome means recognition stream stopped or stalled
+        if (e.error !== "no-speech") {
+          console.warn("Speech recognition notice:", e.error);
         }
+        // Always auto-restart cleanly
+        scheduleRestart(180);
       };
 
       rec.onend = () => {
@@ -866,20 +886,21 @@ export default function VoiceEnhancementDashboard() {
           clearTimeout(commitDebounceTimerRef.current);
         }
         const activeSpeaker = manualSpeakerMode === "auto" ? "you" : manualSpeakerMode;
-        if (activeUtteranceRef.current.trim()) {
-          addSpeakerNote(activeSpeaker, activeUtteranceRef.current.trim());
+        const pending = (activeUtteranceRef.current + " " + pendingFinalRef.current).trim();
+        if (pending) {
+          addSpeakerNote(activeSpeaker, pending);
           activeUtteranceRef.current = "";
+          pendingFinalRef.current = "";
         }
         committedIndexRef.current = 0;
-        scheduleRestart(80);
+        scheduleRestart(100);
       };
 
       rec.start();
       recognitionRef.current = rec;
-      isRestartingRef.current = false;
     } catch (e) {
       console.warn("Could not start recognition:", e);
-      scheduleRestart(500);
+      scheduleRestart(400);
     }
   }, [subtitleLanguage, manualSpeakerMode, addSpeakerNote, scheduleRestart]);
 
@@ -900,15 +921,37 @@ export default function VoiceEnhancementDashboard() {
     }
   }, [isProcessing, subtitlesEnabled, subtitleLanguage, startSpeechRecognition]);
 
-  // Active watchdog ensures recognition never stays dead
+  // Fail-Safe Watchdog: Recovers from silent browser freezes, audio drops, and session limits
   useEffect(() => {
     const watchdog = setInterval(() => {
-      if (isProcessingRef.current && subtitlesEnabledRef.current && !recognitionRef.current && !isRestartingRef.current) {
-        startSpeechRecognition();
+      if (!isProcessingRef.current || !subtitlesEnabledRef.current) return;
+
+      const now = Date.now();
+
+      // Case 1: Recognition reference is missing -> restart immediately
+      if (!recognitionRef.current) {
+        scheduleRestart(80);
+        return;
       }
-    }, 3000);
+
+      // Case 2: User is actively speaking into mic, but recognition hasn't fired in > 3s (frozen recognizer)
+      if (isUserSpeakingLive && now - lastSpeechResultTimeRef.current > 3000) {
+        console.warn("Detected frozen SpeechRecognition during active speech; auto-healing session...");
+        lastSpeechResultTimeRef.current = now;
+        scheduleRestart(60);
+        return;
+      }
+
+      // Case 3: Recognition session has been running for > 35s. To prevent Chromium's 60s hard drop,
+      // refresh it gracefully whenever the user is silent.
+      if (!isUserSpeakingLive && now - sessionStartTimeRef.current > 35000) {
+        sessionStartTimeRef.current = now;
+        scheduleRestart(60);
+      }
+    }, 2000);
+
     return () => clearInterval(watchdog);
-  }, [startSpeechRecognition]);
+  }, [scheduleRestart, isUserSpeakingLive]);
 
   // Capture Meeting / Partner Audio Stream (DisplayMedia Audio)
   const startCapturePartnerAudio = async () => {
